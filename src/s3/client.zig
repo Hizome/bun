@@ -238,6 +238,7 @@ pub fn upload(
     content: []const u8,
     content_type: ?[]const u8,
     content_disposition: ?[]const u8,
+    content_encoding: ?[]const u8,
     acl: ?ACL,
     proxy_url: ?[]const u8,
     storage_class: ?StorageClass,
@@ -252,6 +253,7 @@ pub fn upload(
         .body = content,
         .content_type = content_type,
         .content_disposition = content_disposition,
+        .content_encoding = content_encoding,
         .acl = acl,
         .storage_class = storage_class,
         .request_payer = request_payer,
@@ -265,6 +267,7 @@ pub fn writableStream(
     options: MultiPartUploadOptions,
     content_type: ?[]const u8,
     content_disposition: ?[]const u8,
+    content_encoding: ?[]const u8,
     proxy: ?[]const u8,
     storage_class: ?StorageClass,
     request_payer: bool,
@@ -310,6 +313,7 @@ pub fn writableStream(
         .proxy = if (proxy_url.len > 0) bun.handleOom(bun.default_allocator.dupe(u8, proxy_url)) else "",
         .content_type = if (content_type) |ct| bun.handleOom(bun.default_allocator.dupe(u8, ct)) else null,
         .content_disposition = if (content_disposition) |cd| bun.handleOom(bun.default_allocator.dupe(u8, cd)) else null,
+        .content_encoding = if (content_encoding) |ce| bun.handleOom(bun.default_allocator.dupe(u8, ce)) else null,
         .storage_class = storage_class,
         .request_payer = request_payer,
 
@@ -451,6 +455,7 @@ pub fn uploadStream(
     storage_class: ?StorageClass,
     content_type: ?[]const u8,
     content_disposition: ?[]const u8,
+    content_encoding: ?[]const u8,
     proxy: ?[]const u8,
     request_payer: bool,
     callback: ?*const fn (S3UploadResult, *anyopaque) void,
@@ -489,6 +494,7 @@ pub fn uploadStream(
         .proxy = if (proxy_url.len > 0) bun.handleOom(bun.default_allocator.dupe(u8, proxy_url)) else "",
         .content_type = if (content_type) |ct| bun.handleOom(bun.default_allocator.dupe(u8, ct)) else null,
         .content_disposition = if (content_disposition) |cd| bun.handleOom(bun.default_allocator.dupe(u8, cd)) else null,
+        .content_encoding = if (content_encoding) |ce| bun.handleOom(bun.default_allocator.dupe(u8, ce)) else null,
         .callback = @ptrCast(&S3UploadStreamWrapper.resolve),
         .callback_context = undefined,
         .globalThis = globalThis,
@@ -533,8 +539,6 @@ pub fn downloadStream(
 ) void {
     const range = brk: {
         if (size) |size_| {
-            if (offset == 0) break :brk null;
-
             var end = (offset + size_);
             if (size_ > 0) {
                 end -= 1;
@@ -559,7 +563,7 @@ pub fn downloadStream(
         return;
     };
 
-    var header_buffer: [10]picohttp.Header = undefined;
+    var header_buffer: [S3Credentials.SignResult.MAX_HEADERS + 1]picohttp.Header = undefined;
     const headers = brk: {
         if (range) |range_| {
             const _headers = result.mixWithHeader(&header_buffer, .{ .name = "range", .value = range_ });
@@ -669,10 +673,33 @@ pub fn readableStream(
             }
         }
 
+        /// Clear the cancel_handler on the ByteStream.Source to prevent use-after-free.
+        /// Must be called before releasing readable_stream_ref.
+        fn clearStreamCancelHandler(self: *@This()) void {
+            if (self.readable_stream_ref.get(self.global)) |readable| {
+                if (readable.ptr == .Bytes) {
+                    const source = readable.ptr.Bytes.parent();
+                    source.cancel_handler = null;
+                    source.cancel_ctx = null;
+                }
+            }
+        }
+
         pub fn deinit(self: *@This()) void {
+            self.clearStreamCancelHandler();
             self.readable_stream_ref.deinit();
             bun.default_allocator.free(self.path);
             bun.destroy(self);
+        }
+
+        fn onStreamCancelled(ctx: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            // Release the Strong ref so the ReadableStream can be GC'd.
+            // The download may still be in progress, but the callback will
+            // see readable_stream_ref.get() return null and skip data delivery.
+            // When the download finishes (has_more == false), deinit() will
+            // clean up the remaining resources.
+            self.readable_stream_ref.deinit();
         }
 
         pub fn opaqueCallback(chunk: bun.MutableString, has_more: bool, err: ?Error.S3Error, opaque_self: *anyopaque) void {
@@ -680,6 +707,18 @@ pub fn readableStream(
             callback(chunk, has_more, err, self) catch {}; // TODO: properly propagate exception upwards
         }
     };
+
+    const wrapper = S3DownloadStreamWrapper.new(.{
+        .readable_stream_ref = jsc.WebCore.ReadableStream.Strong.init(.{
+            .ptr = .{ .Bytes = &reader.context },
+            .value = readable_value,
+        }, globalThis),
+        .path = bun.handleOom(bun.default_allocator.dupe(u8, path)),
+        .global = globalThis,
+    });
+
+    reader.cancel_handler = S3DownloadStreamWrapper.onStreamCancelled;
+    reader.cancel_ctx = wrapper;
 
     downloadStream(
         this,
@@ -689,14 +728,7 @@ pub fn readableStream(
         proxy_url,
         request_payer,
         S3DownloadStreamWrapper.opaqueCallback,
-        S3DownloadStreamWrapper.new(.{
-            .readable_stream_ref = jsc.WebCore.ReadableStream.Strong.init(.{
-                .ptr = .{ .Bytes = &reader.context },
-                .value = readable_value,
-            }, globalThis),
-            .path = bun.handleOom(bun.default_allocator.dupe(u8, path)),
-            .global = globalThis,
-        }),
+        wrapper,
     );
     return readable_value;
 }
